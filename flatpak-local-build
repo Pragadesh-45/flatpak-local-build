@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Build a Flatpak app locally from its manifest and install it for the current user.
+#
+# Usage: flatpak-local-build [options] <manifest>
+#
+# Options:
+#   --run              build, install, then launch the app
+#   --uninstall        remove the locally installed build and exit
+#   --clean            delete the build directory and exit
+#   --id ID            app id (default: read from the manifest)
+#   --branch NAME      branch to build and install (default: master)
+#   --build-root DIR   where build files go
+#                      (default: ${XDG_CACHE_HOME:-~/.cache}/flatpak-local-build/<app id>)
+#   --deps-from REMOTE remote to install runtimes/SDKs from (default: flathub)
+#   -h, --help         show this help
+set -euo pipefail
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+die() { echo "flatpak-local-build: $*" >&2; exit 1; }
+
+action=build
+app_id=
+branch=master
+build_root=
+deps_from=flathub
+manifest=
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run) action=run ;;
+    --uninstall) action=uninstall ;;
+    --clean) action=clean ;;
+    --id) app_id="${2:?--id needs a value}"; shift ;;
+    --branch) branch="${2:?--branch needs a value}"; shift ;;
+    --build-root) build_root="${2:?--build-root needs a value}"; shift ;;
+    --deps-from) deps_from="${2:?--deps-from needs a value}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; exit 1 ;;
+    *) [ -z "$manifest" ] || die "only one manifest allowed"; manifest="$1" ;;
+  esac
+  shift
+done
+
+[ -n "$manifest" ] || { usage >&2; exit 1; }
+[ -f "$manifest" ] || die "manifest not found: $manifest"
+manifest="$(cd "$(dirname "$manifest")" && pwd)/$(basename "$manifest")"
+
+# Read the app id from a YAML (`id:` / `app-id:`) or JSON ("id" / "app-id") manifest.
+if [ -z "$app_id" ]; then
+  case "$manifest" in
+    *.json)
+      app_id="$(grep -m1 -oE '"(app-)?id"[[:space:]]*:[[:space:]]*"[^"]+"' "$manifest" |
+        sed -E 's/.*"([^"]+)"$/\1/')" || true ;;
+    *)
+      app_id="$(grep -m1 -E '^(app-)?id:' "$manifest" |
+        sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]+#.*$//; s/^["'\'']//; s/["'\'']$//')" || true ;;
+  esac
+  [ -n "$app_id" ] || die "could not read the app id from $manifest; pass --id"
+fi
+
+build_root="${build_root:-${XDG_CACHE_HOME:-$HOME/.cache}/flatpak-local-build/$app_id}"
+ref="$app_id//$branch"
+
+case "$action" in
+  uninstall) flatpak uninstall --user -y "$ref"; exit ;;
+  clean) rm -rf "$build_root"; echo "Removed $build_root"; exit ;;
+esac
+
+# Prefer a host flatpak-builder; otherwise use the Flathub-packaged one.
+if command -v flatpak-builder >/dev/null 2>&1; then
+  builder=(flatpak-builder)
+else
+  if ! flatpak info --user org.flatpak.Builder >/dev/null 2>&1; then
+    flatpak install --user -y "$deps_from" org.flatpak.Builder
+  fi
+  builder=(flatpak run org.flatpak.Builder)
+fi
+
+mkdir -p "$build_root"
+
+# Export to a local repo and install from the host instead of using --install:
+# apps with extra-data run apply_extra in their own bwrap sandbox, which can't
+# be nested inside the org.flatpak.Builder sandbox.
+"${builder[@]}" \
+  --user \
+  --force-clean \
+  --ccache \
+  --default-branch="$branch" \
+  --install-deps-from="$deps_from" \
+  --state-dir="$build_root/.state" \
+  --repo="$build_root/repo" \
+  "$build_root/build-dir" \
+  "$manifest"
+
+flatpak install --user -y --reinstall "$build_root/repo" "$ref"
+
+echo "Installed local build of $app_id. Run: flatpak run $ref"
+if [ "$action" = run ]; then
+  exec flatpak run "$ref"
+fi
